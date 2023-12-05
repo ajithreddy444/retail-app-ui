@@ -1,0 +1,65 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+    commands:
+      - echo "in the install phase"
+    finally:
+      - echo This always runs even if the login command fails 
+  pre_build:
+    commands:
+      - yum install jq -y
+      - yum install awscli -y
+      - aws --version
+      - wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-4.4.0.2170-linux.zip
+      - unzip sonar-scanner-cli-4.4.0.2170-linux.zip
+      - mv sonar-scanner-4.4.0.2170-linux /opt/sonar-scanner
+      - chmod -R 775 /opt/sonar-scanner
+      - echo "stage pre_build completed"
+  build:
+    commands:
+      - cd $CODEBUILD_SRC_DIR
+      - mvn clean package -q
+      - /opt/sonar-scanner/bin/sonar-scanner -Dsonar.java.binaries=target/classes -Dsonar.sources=. -Dproject.settings=sonar-project.properties -Dsonar.host.url=$SonarQube_URL -Dsonar.login=$SonarQube_Access_Token > sonarqube_scanreport.json
+      - echo "build stage completed"
+      - ls -lrt  
+  
+  post_build:
+    commands:
+      - sonar_link=$(cat sonarqube_scanreport.json | egrep -o "you can browse http://[^, ]+")
+      - sonar_task_id=$(cat sonarqube_scanreport.json | egrep -o "task\?id=[^ ]+" | cut -d'=' -f2)
+      # Allow time for SonarQube background task to complete
+      - |
+        stat="PENDING";
+        while [ "$stat" != "SUCCESS" ]; do
+          if [ $stat = "FAILED" ] || [ $stat = "CANCELLED" ]; then
+            echo "SonarQube task $sonar_task_id failed";
+            exit 1;
+          fi
+          stat=$(curl -u $SonarQube_Access_Token $SonarQube_URL/api/ce/task\?id=$sonar_task_id | jq -r '.task.status');
+          sleep 5;
+        done
+      - sonar_analysis_id=$(curl -u $SonarQube_Access_Token $SonarQube_URL/api/ce/task\?id=$sonar_task_id | jq -r '.task.analysisId')
+      - quality_status=$(curl -u $SonarQube_Access_Token $SonarQube_URL/api/qualitygates/project_status\?analysisId=$sonar_analysis_id | jq -r '.projectStatus.status')
+      - SCAN_RESULT=$(curl -o sonarqube_scanreport.json -u $SonarQube_Access_Token $SonarQube_URL/api/issues/search?createdAfter=2023-10-21&componentKeys=password&severities=CRITICAL,BLOCKER&types=VULNERABILITY&onComponentOnly=true)
+      - echo $quality_status $SCAN_RESULT
+      - cat sonarqube_scanreport.json 
+      - |
+        jq -e "{ \"messageType\": \"CodeScanReport\", \"reportType\": \"SONAR-QUBE\", \"createdAt\": $(date +\"%Y-%m-%dT%H:%M:%S.%3NZ\"), \"source_repository\": \"${CODEBUILD_BUILD_ID}\", \"source_branch\": \"${CODEBUILD_SOURCE_VERSION}\", \"build_id\": \"${CODEBUILD_BUILD_ID}\", \"source_commitid\": \"${CODEBUILD_RESOLVED_SOURCE_VERSION}\", \"report\": . }" sonarqube_scanreport.json  > payload.json
+      - aws s3 cp sonarqube_scanreport.json s3://nag-dev-s3
+      - aws lambda invoke --function-name ImportVulToSecurityHub --cli-binary-format raw-in-base64-out --invocation-type Event --payload file://payload.json sonarqube_scanreport.json  && echo "LAMBDA_SUCCEDED" || echo "LAMBDA_FAILED";
+      - |
+        if [ $quality_status = "ERROR" ] || [ $quality_status = "WARN" ]; then
+          aws lambda invoke --function-name ImportVulToSecurityHub --payload file://payload.json sonarqube_scan_report.json && echo "LAMBDA_SUCCEDED" || echo "LAMBDA_FAILED";
+          echo "in quality_status ERROR or WARN condition"
+          exit 1;
+        elif [ $quality_status = "OK" ]; then
+          echo "in quality_status OK condition"
+        else
+          echo "in quality_status  unexpected condition"
+          exit 1;
+        fi
+artifacts:
+  type: zip
+  files: '**/*'
