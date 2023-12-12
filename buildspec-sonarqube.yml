@@ -47,7 +47,7 @@ phases:
       - cat sonarqube_scanreport.json 
       - |
         jq -e "{ \"messageType\": \"CodeScanReport\", \"reportType\": \"SONAR-QUBE\", \"createdAt\": $(date +\"%Y-%m-%dT%H:%M:%S.%3NZ\"), \"source_repository\": \"${CODEBUILD_BUILD_ID}\", \"source_branch\": \"${CODEBUILD_SOURCE_VERSION}\", \"build_id\": \"${CODEBUILD_BUILD_ID}\", \"source_commitid\": \"${CODEBUILD_RESOLVED_SOURCE_VERSION}\", \"report\": . }" sonarqube_scanreport.json  > payload.json
-      - aws s3 cp sonarqube_scanreport.json s3://nag-dev-s3
+      - aws s3 cp sonarqube_scanreport.json s3://$s3
       - aws lambda invoke --function-name ImportVulToSecurityHub --cli-binary-format raw-in-base64-out --invocation-type Event --payload file://payload.json sonarqube_scanreport.json  && echo "LAMBDA_SUCCEDED" || echo "LAMBDA_FAILED";
       - |
         if [ $quality_status = "ERROR" ] || [ $quality_status = "WARN" ]; then
